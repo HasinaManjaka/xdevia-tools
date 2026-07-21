@@ -1,0 +1,56 @@
+{
+  "name": "@xdevia/dev-tools",
+  "version": "0.1.0",
+  "description": "Reusable local development workflow CLI for XDevia projects — starts your backend, tunnels it with ngrok, and wires the public URL into your frontend .env automatically.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "xdev": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli/index.ts",
+    "start": "node dist/cli/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "execa": "^9.5.1",
+    "ora": "^8.1.1",
+    "prompts": "^2.4.2",
+    "tree-kill": "^1.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/prompts": "^2.4.9",
+    "@typescript-eslint/eslint-plugin": "^8.18.1",
+    "@typescript-eslint/parser": "^8.18.1",
+    "eslint": "^8.57.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "keywords": [
+    "cli",
+    "devtools",
+    "ngrok",
+    "expo",
+    "backend",
+    "developer-experience",
+    "xdevia"
+  ]
+}
