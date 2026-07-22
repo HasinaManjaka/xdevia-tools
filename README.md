@@ -195,6 +195,13 @@ Something else is already listening on the detected port. Stop it, or set
 **"ngrok is not installed or not available on your PATH"**
 Install it from <https://ngrok.com/download>, or via your package manager.
 
+**"ngrok did not expose a public URL for the backend in time" while another ngrok agent (e.g. Expo's tunnel) is running**
+xdev launches its own ngrok agent on an isolated local web-interface port
+specifically so it never reads another agent's tunnels (this used to be a
+bug — see [Development guide](#development-guide) note below). If you still
+hit this, it usually means your installed ngrok version predates the
+`--web-addr` flag; update ngrok to the latest version.
+
 **"ngrok did not expose a public URL in time"**
 Usually means ngrok isn't authenticated yet — run
 `ngrok config add-authtoken <token>` — or another ngrok agent is already

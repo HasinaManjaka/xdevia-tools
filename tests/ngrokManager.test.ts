@@ -52,8 +52,8 @@ describe('startNgrokTunnel', () => {
     axiosGetMock.mockResolvedValueOnce({
       data: {
         tunnels: [
-          { public_url: 'http://abc.ngrok-free.dev', proto: 'http' },
-          { public_url: 'https://abc.ngrok-free.dev', proto: 'https' },
+          { public_url: 'http://abc.ngrok-free.dev', proto: 'http', config: { addr: 'http://localhost:4000' } },
+          { public_url: 'https://abc.ngrok-free.dev', proto: 'https', config: { addr: 'http://localhost:4000' } },
         ],
       },
     });
@@ -62,6 +62,33 @@ describe('startNgrokTunnel', () => {
     expect(handle.info.publicUrl).toBe('https://abc.ngrok-free.dev');
     expect(handle.info.proto).toBe('https');
     expect(handle.process.pid).toBe(4242);
+
+    // The agent must be launched on its own isolated web-interface port,
+    // never assuming the default 4040 (which another ngrok agent, e.g.
+    // Expo's tunnel, might already own).
+    const [, args] = execaMock.mock.calls[1] as [string, string[]];
+    expect(args).toContain('http');
+    expect(args).toContain('4000');
+    expect(args.some((a) => /^--web-addr=127\.0\.0\.1:\d+$/.test(a))).toBe(true);
+  });
+
+  it('ignores an unrelated tunnel already running on the same agent-lookalike response and picks our backend port', async () => {
+    execaMock.mockResolvedValueOnce({ stdout: 'ngrok 3.0.0' });
+    const fakeChild = makeFakeChild();
+    execaMock.mockReturnValueOnce(fakeChild);
+
+    axiosGetMock.mockResolvedValueOnce({
+      data: {
+        tunnels: [
+          // e.g. a stray tunnel forwarding to Expo's dev server on a different port
+          { public_url: 'https://expo-tunnel.ngrok-free.dev', proto: 'https', config: { addr: 'http://localhost:8081' } },
+          { public_url: 'https://backend-tunnel.ngrok-free.dev', proto: 'https', config: { addr: 'http://localhost:4000' } },
+        ],
+      },
+    });
+
+    const handle = await startNgrokTunnel({ port: 4000, timeoutMs: 2000, pollIntervalMs: 10 });
+    expect(handle.info.publicUrl).toBe('https://backend-tunnel.ngrok-free.dev');
   });
 
   it('throws NgrokError if the local API never reports a tunnel before the timeout', async () => {
