@@ -95,14 +95,14 @@ async function runInteractiveSetup(cwd: string): Promise<XdevConfig> {
     {
       type: 'text',
       name: 'backendPath',
-      message: 'Does your backend serve an API under a base path? (e.g. /api/v1)',
+      message: 'Base path? (e.g. /api/v1, /v2 — must start with /, no trailing /)',
       initial: '',
       validate: (value: string) => {
         if (!value || value.trim().length === 0) return true;
-        if (!value.startsWith('/')) return 'Path must start with a / (e.g. /api/v1)';
-        if (value.endsWith('/')) return 'Path must not end with a /';
-        if (value.includes('//')) return 'Path must not contain double slashes';
-        if (!/^\/[\w./-]+$/.test(value)) return 'Path can only contain letters, numbers, dots, hyphens, and slashes';
+        if (!value.startsWith('/')) return 'Must start with a / (e.g. /api/v1)';
+        if (value.endsWith('/')) return 'Must not end with a /';
+        if (value.includes('//')) return 'Must not contain double slashes';
+        if (!/^\/[\w./-]+$/.test(value)) return 'Only letters, numbers, dots, hyphens, and slashes allowed';
         return true;
       },
     },
