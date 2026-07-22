@@ -196,11 +196,16 @@ Something else is already listening on the detected port. Stop it, or set
 Install it from <https://ngrok.com/download>, or via your package manager.
 
 **"ngrok did not expose a public URL for the backend in time" while another ngrok agent (e.g. Expo's tunnel) is running**
-xdev launches its own ngrok agent on an isolated local web-interface port
-specifically so it never reads another agent's tunnels (this used to be a
-bug — see [Development guide](#development-guide) note below). If you still
-hit this, it usually means your installed ngrok version predates the
-`--web-addr` flag; update ngrok to the latest version.
+xdev discovers its ngrok agent's local API address from the agent's own logs
+rather than assuming port 4040, so a second local agent won't get confused
+with another one. That said, ngrok's **free tier only allows one
+simultaneous agent session per account** — if Expo (or anything else using
+`--tunnel` mode) already has a session open, starting a second one can be
+rejected by ngrok's servers outright. xdev detects this specific case and
+tells you directly; the fix is to stop the other tunnel first, combine both
+endpoints into a single agent session via an ngrok config file
+(`ngrok start --all` — see <https://ngrok.com/docs/agent/config/>), or
+upgrade your ngrok plan.
 
 **"ngrok did not expose a public URL in time"**
 Usually means ngrok isn't authenticated yet — run

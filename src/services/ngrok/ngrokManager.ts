@@ -3,7 +3,6 @@ import { execa, type ResultPromise } from 'execa';
 
 import type { ManagedProcess, NgrokTunnelInfo } from '../../types/index.js';
 import { NetworkError, NgrokError } from '../../errors/index.js';
-import { getFreePort } from '../../utils/port.js';
 
 export interface NgrokTunnelHandle {
   process: ManagedProcess;
@@ -28,48 +27,69 @@ export interface StartNgrokOptions {
   pollIntervalMs?: number;
 }
 
+const DEFAULT_LOCAL_API = 'http://127.0.0.1:4040/api/tunnels';
+
 /**
  * Launches `ngrok http <port>` and polls that agent's local API until a
  * public URL is available for our backend (or the timeout elapses).
  *
  * Two things matter here that are easy to get wrong:
  *
- * 1. **Isolation**: ngrok's local API defaults to 127.0.0.1:4040, but that's
- *    per *agent*, not global. If another ngrok agent is already running on
- *    this machine (e.g. Expo's `--tunnel` mode, which spins up its own ngrok
- *    process), it may already own port 4040. We never assume 4040 is ours —
- *    we ask the OS for a free port and tell our ngrok agent to use that one
- *    via `--web-addr`, so we always talk to *our* agent, never someone else's.
+ * 1. **Finding the right local API address.** ngrok's local web
+ *    interface/API defaults to 127.0.0.1:4040, but that's a *default*, not a
+ *    guarantee — and there's no supported CLI flag to force it to a
+ *    different port on all ngrok versions (`--web-addr` only exists in
+ *    config files, not as a CLI flag, and CLI flags vary across versions).
+ *    So instead of assuming a port, we read it straight from ngrok's own
+ *    startup logs (`--log=stdout --log-format=json` emits a
+ *    `"starting web service"` line with the real bound address) and use
+ *    exactly that.
  *
- * 2. **Matching**: even talking to the right agent, we still confirm the
- *    tunnel we pick is actually forwarding to the backend port we asked for
- *    (via the tunnel's `config.addr`), rather than blindly taking "the first
- *    https tunnel" the API returns.
+ * 2. **Matching the right tunnel.** Even once we're talking to the right
+ *    agent, we still confirm the tunnel we pick is actually forwarding to
+ *    the backend port we asked for (via the tunnel's `config.addr`), rather
+ *    than blindly taking "the first https tunnel" the API returns.
+ *
+ * On top of that, ngrok's free tier only allows **one simultaneous agent
+ * session per account**. If something else — Expo's `--tunnel` mode is a
+ * common culprit, since it runs its own ngrok agent — already has a session
+ * open, our `ngrok http` call can be rejected outright by ngrok's servers.
+ * We detect that specific case and say so plainly, since no local port
+ * juggling can work around it.
  */
 export async function startNgrokTunnel(options: StartNgrokOptions): Promise<NgrokTunnelHandle> {
   const { port, timeoutMs = 15000, pollIntervalMs = 500 } = options;
 
   await assertNgrokInstalled();
 
-  const webAddrPort = await getFreePort().catch((err) => {
-    throw new NgrokError('Could not find a free local port for ngrok\'s web interface.', {
-      hint: 'This is unusual — try again, or free up some local ports and retry.',
-      cause: err,
-    });
-  });
-  const webAddr = `127.0.0.1:${webAddrPort}`;
-  const localApiUrl = `http://${webAddr}/api/tunnels`;
-
   const child = execa(
     'ngrok',
-    ['http', String(port), `--web-addr=${webAddr}`, '--log=stdout'],
+    ['http', String(port), '--log=stdout', '--log-format=json'],
     { reject: false, all: true }
   );
 
   const startupErrors: string[] = [];
+  let discoveredLocalApi: string | undefined;
+  let sessionLimitHit = false;
+
   child.all?.on('data', (chunk: Buffer) => {
     const text = chunk.toString('utf-8');
-    if (/err|error|panic/i.test(text)) startupErrors.push(text.trim());
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+
+      if (/simultaneous ngrok agent session|ERR_NGROK_108/i.test(line)) {
+        sessionLimitHit = true;
+      }
+
+      const parsed = tryParseJsonLogLine(line);
+      if (parsed?.msg === 'starting web service' && typeof parsed.addr === 'string') {
+        discoveredLocalApi = `http://${parsed.addr}/api/tunnels`;
+      }
+
+      if (/err|error|panic/i.test(line)) {
+        startupErrors.push(line.trim());
+      }
+    }
   });
 
   let exited = false;
@@ -78,7 +98,7 @@ export async function startNgrokTunnel(options: StartNgrokOptions): Promise<Ngro
   });
 
   const info = await pollForTunnel({
-    localApiUrl,
+    getLocalApiUrl: () => discoveredLocalApi ?? DEFAULT_LOCAL_API,
     targetPort: port,
     timeoutMs,
     pollIntervalMs,
@@ -87,13 +107,22 @@ export async function startNgrokTunnel(options: StartNgrokOptions): Promise<Ngro
 
   if (!info) {
     child.kill('SIGTERM');
+
+    if (sessionLimitHit) {
+      throw new NgrokError('ngrok rejected the connection: your account already has an active agent session.', {
+        hint:
+          "This isn't a local conflict — ngrok's free tier only allows one running agent at a time per account. " +
+          'If Expo (or anything else using `--tunnel` mode) already has an ngrok session open, stop that first, ' +
+          'or run both endpoints from a single agent session using an ngrok config file with `ngrok start --all` ' +
+          '(see https://ngrok.com/docs/agent/config/), or upgrade your ngrok plan.',
+      });
+    }
+
     throw new NgrokError('ngrok did not expose a public URL for the backend in time.', {
       hint:
         startupErrors.length > 0
           ? `ngrok reported: ${startupErrors[startupErrors.length - 1]}`
-          : 'Make sure ngrok is authenticated (`ngrok config add-authtoken <token>`). ' +
-            'If this keeps happening, your installed ngrok version may not support the ' +
-            '"--web-addr" flag — try updating ngrok to the latest version.',
+          : 'Make sure ngrok is authenticated (`ngrok config add-authtoken <token>`) and that no other process is blocking its startup.',
     });
   }
 
@@ -121,8 +150,25 @@ async function assertNgrokInstalled(): Promise<void> {
   }
 }
 
+interface NgrokLogLine {
+  msg?: string;
+  addr?: string;
+  [key: string]: unknown;
+}
+
+function tryParseJsonLogLine(line: string): NgrokLogLine | undefined {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('{')) return undefined;
+  try {
+    return JSON.parse(trimmed) as NgrokLogLine;
+  } catch {
+    return undefined;
+  }
+}
+
 interface PollOptions {
-  localApiUrl: string;
+  /** Resolved lazily on each poll, since we may not know the real address until ngrok logs it. */
+  getLocalApiUrl: () => string;
   targetPort: number;
   timeoutMs: number;
   pollIntervalMs: number;
@@ -135,7 +181,7 @@ async function pollForTunnel(options: PollOptions): Promise<NgrokTunnelInfo | un
   while (Date.now() < deadline) {
     if (options.isProcessDead()) return undefined;
 
-    const tunnel = await tryFetchTunnel(options.localApiUrl, options.targetPort);
+    const tunnel = await tryFetchTunnel(options.getLocalApiUrl(), options.targetPort);
     if (tunnel) return tunnel;
 
     await delay(options.pollIntervalMs);
@@ -148,9 +194,8 @@ async function tryFetchTunnel(localApiUrl: string, targetPort: number): Promise<
     const { data } = await axios.get<NgrokApiResponse>(localApiUrl, { timeout: 2000 });
 
     // Prefer a tunnel we can confirm is actually forwarding to our backend
-    // port. Since this agent was started in isolation just for this port,
-    // this should always be true once the tunnel is up — the check is a
-    // belt-and-suspenders guard against picking the wrong one.
+    // port — belt-and-suspenders guard against ever picking the wrong one
+    // (e.g. a stray tunnel from another endpoint on the same agent).
     const matching = data.tunnels.filter((t) => tunnelTargetsPort(t, targetPort));
     const pool = matching.length > 0 ? matching : data.tunnels;
 

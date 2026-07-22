@@ -10,17 +10,25 @@ vi.mock('axios', () => ({
 }));
 
 function makeFakeChild() {
+  let resolveExit: (() => void) | undefined;
+  const exitPromise = new Promise<void>((resolve) => {
+    resolveExit = resolve;
+  });
+
   const emitter = new EventEmitter() as EventEmitter & {
     all?: EventEmitter;
     pid: number;
     kill: (signal?: string) => void;
     then: (fn: () => void) => Promise<void>;
+    simulateExit: () => void;
   };
   emitter.all = new EventEmitter();
   emitter.pid = 4242;
-  emitter.kill = vi.fn();
-  // Make it thenable so `await child` / `child.then(...)` works like a real execa result promise.
-  emitter.then = (fn: () => void) => new Promise((resolve) => resolve(undefined)).then(fn);
+  emitter.kill = vi.fn(() => resolveExit?.());
+  // Only resolves when the test (or a `kill()` call) explicitly triggers it —
+  // mirrors a real execa child, which stays pending until the process exits.
+  emitter.then = (fn: () => void) => exitPromise.then(fn);
+  emitter.simulateExit = () => resolveExit?.();
   return emitter;
 }
 
@@ -44,35 +52,49 @@ describe('startNgrokTunnel', () => {
     await expect(startNgrokTunnel({ port: 4000, timeoutMs: 500 })).rejects.toThrow(NgrokError);
   });
 
-  it('resolves with the https public URL once the local API reports a tunnel', async () => {
-    execaMock.mockResolvedValueOnce({ stdout: 'ngrok 3.0.0' }); // `ngrok version` check
+  it('never passes an unsupported --web-addr flag (not a real ngrok v3 CLI flag)', async () => {
+    execaMock.mockResolvedValueOnce({ stdout: 'ngrok 3.0.0' });
     const fakeChild = makeFakeChild();
-    execaMock.mockReturnValueOnce(fakeChild); // the actual `ngrok http <port>` process
-
+    execaMock.mockReturnValueOnce(fakeChild);
     axiosGetMock.mockResolvedValueOnce({
-      data: {
-        tunnels: [
-          { public_url: 'http://abc.ngrok-free.dev', proto: 'http', config: { addr: 'http://localhost:4000' } },
-          { public_url: 'https://abc.ngrok-free.dev', proto: 'https', config: { addr: 'http://localhost:4000' } },
-        ],
-      },
+      data: { tunnels: [{ public_url: 'https://abc.ngrok-free.dev', proto: 'https', config: { addr: 'http://localhost:4000' } }] },
+    });
+
+    await startNgrokTunnel({ port: 4000, timeoutMs: 2000, pollIntervalMs: 10 });
+
+    const [, args] = execaMock.mock.calls[1] as [string, string[]];
+    expect(args.some((a) => a.startsWith('--web-addr'))).toBe(false);
+  });
+
+  it('discovers the real local API address from ngrok\'s own JSON logs instead of assuming 4040', async () => {
+    execaMock.mockResolvedValueOnce({ stdout: 'ngrok 3.0.0' });
+    const fakeChild = makeFakeChild();
+    execaMock.mockReturnValueOnce(fakeChild);
+
+    // ngrok logs it bound its web service to a non-default port.
+    setTimeout(() => {
+      fakeChild.all?.emit(
+        'data',
+        Buffer.from(JSON.stringify({ lvl: 'info', msg: 'starting web service', obj: 'web', addr: '127.0.0.1:4041' }) + '\n')
+      );
+    }, 5);
+
+    axiosGetMock.mockImplementation((url: string) => {
+      if (url === 'http://127.0.0.1:4041/api/tunnels') {
+        return Promise.resolve({
+          data: { tunnels: [{ public_url: 'https://abc.ngrok-free.dev', proto: 'https', config: { addr: 'http://localhost:4000' } }] },
+        });
+      }
+      const err = new AxiosError('ECONNREFUSED');
+      (err as AxiosError).code = 'ECONNREFUSED';
+      return Promise.reject(err);
     });
 
     const handle = await startNgrokTunnel({ port: 4000, timeoutMs: 2000, pollIntervalMs: 10 });
     expect(handle.info.publicUrl).toBe('https://abc.ngrok-free.dev');
-    expect(handle.info.proto).toBe('https');
-    expect(handle.process.pid).toBe(4242);
-
-    // The agent must be launched on its own isolated web-interface port,
-    // never assuming the default 4040 (which another ngrok agent, e.g.
-    // Expo's tunnel, might already own).
-    const [, args] = execaMock.mock.calls[1] as [string, string[]];
-    expect(args).toContain('http');
-    expect(args).toContain('4000');
-    expect(args.some((a) => /^--web-addr=127\.0\.0\.1:\d+$/.test(a))).toBe(true);
   });
 
-  it('ignores an unrelated tunnel already running on the same agent-lookalike response and picks our backend port', async () => {
+  it('ignores an unrelated tunnel and picks the one matching our backend port', async () => {
     execaMock.mockResolvedValueOnce({ stdout: 'ngrok 3.0.0' });
     const fakeChild = makeFakeChild();
     execaMock.mockReturnValueOnce(fakeChild);
@@ -89,6 +111,27 @@ describe('startNgrokTunnel', () => {
 
     const handle = await startNgrokTunnel({ port: 4000, timeoutMs: 2000, pollIntervalMs: 10 });
     expect(handle.info.publicUrl).toBe('https://backend-tunnel.ngrok-free.dev');
+  });
+
+  it('throws a specific, actionable NgrokError when the account session limit is hit', async () => {
+    execaMock.mockResolvedValueOnce({ stdout: 'ngrok 3.0.0' });
+    const fakeChild = makeFakeChild();
+    execaMock.mockReturnValueOnce(fakeChild);
+
+    setTimeout(() => {
+      fakeChild.all?.emit(
+        'data',
+        Buffer.from('ERROR:  Your account is limited to 1 simultaneous ngrok agent session. (ERR_NGROK_108)\n')
+      );
+    }, 5);
+
+    const err = new AxiosError('ECONNREFUSED');
+    (err as AxiosError).code = 'ECONNREFUSED';
+    axiosGetMock.mockRejectedValue(err);
+
+    await expect(
+      startNgrokTunnel({ port: 4000, timeoutMs: 300, pollIntervalMs: 10 })
+    ).rejects.toThrow(/active agent session/i);
   });
 
   it('throws NgrokError if the local API never reports a tunnel before the timeout', async () => {
