@@ -1,0 +1,95 @@
+## Possible Failure Scenarios in @xdevia/dev-tools
+
+### 1. Race Conditions
+
+**Port TOCTOU (dev.ts:38 + later backend start):**
+isPortFree() checks port availability, then the backend is started later. Another process can claim the port between the check and the bind. The backend would fail with an "address already in use" error that the startup heuristic might or might not catch.
+
+**Backend startup grace period heuristic (processRunner.ts:33,58):**
+The 2500ms grace period is arbitrary. A backend that crashes after 3s (e.g., delayed DB connection timeout) is considered "started" — ngrok tunnels to nothing, the .env is written, and the user sees a broken URL. Conversely, a slow-starting backend (<3s crash) is correctly caught.
+
+
+### 2. ngrok Log Chunk Splitting (High Impact)
+
+ngrokManager.ts:75-92 — The child.all?.on('data', ...) handler receives raw Buffer chunks, not complete lines. If the JSON log line {"msg":"starting web service","addr":"127.0.0.1:4041"} is split across two chunks, neither half parses as valid JSON. The discoveredLocalApi variable is never set, the poll falls back to DEFAULT_LOCAL_API (4040), and if ngrok isn't on 4040, the entire tunnel setup times out with a misleading error. There is no line-buffering between chunks.
+
+
+### 3. ngrok Auth Not Verified
+
+assertNgrokInstalled() (ngrokManager.ts:142) only runs "ngrok version" to check existence. An unauthenticated ngrok binary will pass this check, start the process, then fail to establish a tunnel — the user gets a generic timeout error after 15s instead of an immediate "run ngrok config add-authtoken" message.
+
+
+### 4. Backend Death After Startup Goes Unnoticed
+
+processRunner.ts:69-81 — Once the 2.5s grace period passes, startManagedProcess resolves. If the backend then crashes at t=4s, the output is still streamed/logged, but nothing in dev.ts reacts to it. ngrok continues tunneling to a dead port, the .env already has the URL, and the user sees ngrok errors or connection refused on the frontend with no clear cause.
+
+
+### 5. splitCommand Breaks on Quoted Arguments
+
+processRunner.ts:99-101:
+  function splitCommand(command: string): string[] {
+    return command.trim().split(/\s+/);
+  }
+Commands with quoted arguments fail:
+  - node --require "my module" server.js -> ["node", "--require", "\"my", "module\"", "server.js"]
+  - npm run dev -- --host "0.0.0.0" -> same problem
+This affects any backendCommand override in .xdevrc.json containing quoted paths or spaces.
+
+
+### 6. Backend Command with Inline Env Vars Fails
+
+If a user sets backendCommand: "PORT=3000 npm run dev" in .xdevrc.json, splitCommand produces ["PORT=3000", "npm", "run", "dev"], making execa try to execute PORT=3000 as a binary name. This silently fails.
+
+
+### 7. child.pid Undefined = Orphaned Processes
+
+processRunner.ts:74 and ngrokManager.ts:132 — If execa fails to spawn (e.g., binary not found after initial assertNgrokInstalled check due to PATH changes), child.pid is undefined and kill() silently does nothing. The Promise.race with delay(3000) resolves, but there is nothing to clean up — and no SIGKILL escalation if SIGTERM is ignored.
+
+
+### 8. Port Values > 65535 Pass Validation
+
+portDetector.ts:56-57 checks Number.isFinite(parsed) && parsed > 0 but not parsed <= 65535. A port value of 99999 in .env or .xdevrc.json passes validation but fails at net.createServer().listen() with an obscure ERR_SOCKET_BAD_PORT.
+
+
+### 9. Cross-Platform Failures
+
+- child.kill('SIGTERM') does not work properly on Windows (Node.js maps it to process termination but without graceful cleanup).
+- #!/usr/bin/env node shebang is ignored on Windows; the xdev binary needs a .cmd shim.
+- path.relative() in configManager.ts:94 uses OS separators; if configs are somehow shared between OSes, paths would be wrong.
+
+
+### 10. .env CRLF Normalization
+
+envFile.ts:27 splits on /\r?\n/ but line 36 joins with \n. This silently converts CRLF to LF on every update, causing unnecessary git diffs in projects that enforce CRLF endings.
+
+
+### 11. ngrok Local API Assume-Then-Verify Gap
+
+ngrokManager.ts:101 — getLocalApiUrl returns discoveredLocalApi ?? DEFAULT_LOCAL_API. If another service happens to be listening on port 4040 (e.g., another ngrok agent, a local proxy), tryFetchTunnel could successfully fetch tunnels from that other service. The tunnelTargetsPort filter mitigates this, but if that other agent also has a tunnel targeting the same port, the wrong tunnel URL would be returned.
+
+
+### 12. ngrok Timeout Ignores Real Errors
+
+ngrokManager.ts:89-92 — Lines matching /err|error|panic/i are collected into startupErrors, but they are only surfaced as hints if the poll times out. An ngrok error at t=1s (e.g., invalid auth token) does not abort early — the poll keeps hammering the local API for the full 15s before failing.
+
+
+### 13. Config Schema Migration Missing
+
+configManager.ts:57-64 applies defaults for missing fields silently. If a future v2 config changes the structure (e.g., renames frontendPath to paths.frontend), old v1 configs would load without error but with wrong behavior. The version field is read but never acted on.
+
+
+### 14. Unhandled Promise Rejection
+
+ngrokManager.ts:96-98:
+  void child.then(() => { exited = true; });
+The void discards the promise. While reject: false means execa resolves on non-zero exit, if something throws inside the .then() callback, it becomes an unhandled rejection.
+
+
+### 15. Monorepo / npm Workspace Issues
+
+commandDetector.ts:53 hardcodes "npm run ${name}". In a pnpm/yarn monorepo workspace, this might resolve to the wrong package's script, or fail entirely if the backend uses a non-npm package manager.
+
+
+---
+
+Highest-impact issues: #2 (chunk splitting), #3 (missing auth check), #4 (undetected backend death), and #5 (splitCommand). These are real-world scenarios that will hit users and produce confusing errors.

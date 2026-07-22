@@ -71,9 +71,14 @@ export async function runDevCommand(options: DevCommandOptions = {}): Promise<Ma
     managedProcesses.push(ngrokHandle.process);
     ngrokSpinner.succeed('Ngrok started');
 
+    const baseUrl = ngrokHandle.info.publicUrl;
+    const fullUrl = config.backendPath
+      ? baseUrl.replace(/\/+$/, '') + '/' + config.backendPath.replace(/^\/+/, '')
+      : baseUrl;
+
     logger.success('URL detected');
     logger.raw('');
-    logger.raw(`  ${chalk.underline.cyanBright(ngrokHandle.info.publicUrl)}`);
+    logger.raw(`  ${chalk.underline.cyanBright(fullUrl)}`);
     logger.raw('');
 
     // --- Frontend .env ---------------------------------------------------
@@ -81,7 +86,7 @@ export async function runDevCommand(options: DevCommandOptions = {}): Promise<Ma
     const result = await updateFrontendEnv({
       frontendDir,
       variableName: config.envVariable,
-      value: ngrokHandle.info.publicUrl,
+      value: fullUrl,
     });
     envSpinner.succeed(
       `Frontend .env ${result.action === 'appended' ? 'updated (appended)' : 'updated'} at ${result.envPath}`

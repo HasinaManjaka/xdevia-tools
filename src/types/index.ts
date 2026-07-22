@@ -14,6 +14,8 @@ export interface XdevConfig {
   backendCommand?: string;
   /** Optional explicit backend port override (skips auto-detection). */
   backendPort?: number;
+  /** Optional base path appended to the ngrok public URL (e.g. "/api/v1"). Empty string means no path. */
+  backendPath?: string;
   /** Schema version, used for future migrations. */
   version: number;
 }

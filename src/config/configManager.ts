@@ -60,6 +60,7 @@ async function readConfigFile(configPath: string): Promise<XdevConfig> {
     ngrok: typeof raw['ngrok'] === 'boolean' ? raw['ngrok'] : true,
     backendCommand: typeof raw['backendCommand'] === 'string' ? raw['backendCommand'] : undefined,
     backendPort: typeof raw['backendPort'] === 'number' ? raw['backendPort'] : undefined,
+    backendPath: typeof raw['backendPath'] === 'string' ? raw['backendPath'] : undefined,
     version: typeof raw['version'] === 'number' ? raw['version'] : CONFIG_SCHEMA_VERSION,
   };
 }
@@ -90,10 +91,28 @@ async function runInteractiveSetup(cwd: string): Promise<XdevConfig> {
   const resolvedPath = resolveUserPath(rawFrontendPath, cwd);
   await validateFrontendPath(resolvedPath);
 
+  const pathResponse = await prompts(
+    {
+      type: 'text',
+      name: 'backendPath',
+      message: 'Does your backend serve an API under a base path? (e.g. /api/v1)',
+      initial: '',
+    },
+    {
+      onCancel: () => {
+        throw new UserCancelledError('Setup cancelled — no configuration was saved.');
+      },
+    }
+  );
+
+  const rawBackendPath = (pathResponse['backendPath'] as string | undefined)?.trim();
+  const backendPath = rawBackendPath && rawBackendPath.length > 0 ? rawBackendPath : undefined;
+
   return {
     frontendPath: path.relative(cwd, resolvedPath) || '.',
     envVariable: DEFAULT_ENV_VARIABLE,
     ngrok: true,
+    backendPath,
     version: CONFIG_SCHEMA_VERSION,
   };
 }
